@@ -1,0 +1,10 @@
+[fmt]
+printWidth = 110
+endOfLine = "lf"
+semi = true
+trailingComma = "all"
+sortImports = true
+
+[install]
+exact = true
+minimumReleaseAge = 259200
