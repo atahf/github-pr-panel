@@ -24,6 +24,7 @@ type IconName =
   | "git-pull-request"
   | "git-pull-request-draft"
   | "key"
+  | "shield-lock"
   | "sign-in"
   | "sync"
   | "x";
@@ -198,10 +199,19 @@ const ssoBanner = (org: string) =>
 const ssoUnknownBanner = () =>
   banner("warning", "alert", ["Couldn't check SSO status. GitHub may have changed its page format."]);
 
-const banners = ({ ssoOrgs, ssoUnknown, error }: PanelState) =>
+// Nothing to click: only the org or a different network can lift the block
+const ipBlockedBanner = (org: string) =>
+  banner("info", "shield-lock", [
+    h("strong", {}, org),
+    " has an IP allow list that blocks your current IP, so its PRs are hidden.",
+    h("small", { class: "banner-detail" }, "Connect from an allowed network, like a VPN, to see them."),
+  ]);
+
+const banners = ({ ssoOrgs, ssoUnknown, ipBlockedOrgs, error }: PanelState) =>
   [
     ...ssoOrgs.map(ssoBanner),
     ssoUnknown ? ssoUnknownBanner() : null,
+    ...ipBlockedOrgs.map(ipBlockedBanner),
     error ? errorBanner(error) : null,
   ].filter((el) => el !== null);
 
@@ -436,8 +446,16 @@ const updateTimes = () => {
 
 // Redraw only when what's shown changed, so keyboard focus isn't lost and banners aren't re-announced
 const redraw = () => {
-  const { review, mine, error, ssoOrgs, ssoUnknown } = panel;
-  const content = JSON.stringify({ review, mine, error, ssoOrgs, ssoUnknown, queries: settings.queries });
+  const { review, mine, error, ssoOrgs, ssoUnknown, ipBlockedOrgs } = panel;
+  const content = JSON.stringify({
+    review,
+    mine,
+    error,
+    ssoOrgs,
+    ssoUnknown,
+    ipBlockedOrgs,
+    queries: settings.queries,
+  });
   if (settingsOpen || content === drawnContent) return;
   drawnContent = content;
   bannersEl.replaceChildren(...banners(panel));
@@ -475,7 +493,7 @@ const start = async () => {
     if (area !== "local") return;
     if (changes.settings) settings = sanitizeSettings(changes.settings.newValue);
     if (!changes.panel) return;
-    panel = (changes.panel.newValue as PanelState | undefined) ?? EMPTY_PANEL;
+    panel = { ...EMPTY_PANEL, ...(changes.panel.newValue as PanelState | undefined) };
     render();
   });
   setInterval(updateTimes, TICK_MS);

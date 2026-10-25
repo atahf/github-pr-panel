@@ -7,6 +7,8 @@ Chrome side panel listing open GitHub PRs awaiting your review and PRs you autho
 - CI checks and review status per PR
 - Toolbar badge with the number of review requests, or `!` when you're logged out or an org's SSO session has expired
 - Banners for login, SSO, rate limit and connection problems, with a faster refresh after re-authenticating
+- A banner for each of your orgs whose IP allow list blocks your current IP, since GitHub leaves their PRs out of
+  search without saying so
 - Clicking a PR focuses its tab if it's already open; Cmd/Ctrl-click or middle-click opens it in the background
 
 ## Install

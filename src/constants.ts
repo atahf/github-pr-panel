@@ -26,6 +26,9 @@ export const EMPTY_PANEL: PanelState = {
   error: null,
   ssoOrgs: [],
   ssoUnknown: false,
+  ipBlockedOrgs: [],
+  ipCheckedAt: null,
+  memberOrgs: null,
   fetchedAt: null,
   refreshing: false,
 };

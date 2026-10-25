@@ -37,12 +37,21 @@ export type PanelError =
   | { kind: "search_error"; message: string }
   | { kind: "failed"; detail: string };
 
+export type MemberOrgs = {
+  login: string;
+  orgs: string[];
+  fetchedAt: number;
+};
+
 export type PanelState = {
   review: Section | null;
   mine: Section | null;
   error: PanelError | null;
   ssoOrgs: string[];
   ssoUnknown: boolean;
+  ipBlockedOrgs: string[];
+  ipCheckedAt: number | null;
+  memberOrgs: MemberOrgs | null;
   fetchedAt: number | null;
   refreshing: boolean;
 };

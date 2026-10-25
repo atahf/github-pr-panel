@@ -2,6 +2,7 @@ import { afterEach, describe, expect, mock, spyOn, test } from "bun:test";
 
 import { EMPTY_PANEL, UNKNOWN_ORG } from "~/constants";
 import {
+  checkIpAllowLists,
   classifyResponse,
   extractEmbeddedData,
   fetchPanel,
@@ -9,9 +10,13 @@ import {
   findSsoBlockedOrgs,
   FormatError,
   GithubError,
+  IP_CHECK_INTERVAL_MS,
+  ipBlockedOrgOf,
   isSsoWall,
   MAX_PAGES,
+  MEMBER_ORGS_TTL_MS,
   parseDeferred,
+  parseMemberOrgs,
   parseSearchPage,
   RATE_LIMIT_FALLBACK_MS,
   toPanelError,
@@ -128,6 +133,11 @@ describe("parseSearchPage", () => {
   test("reports SSO as unknown when sso_organizations is missing", () => {
     expect(parseSearchPage(page([], {})).ssoOrgs).toBeNull();
     expect(parseSearchPage({ payload: page([]).payload }).ssoOrgs).toBeNull();
+  });
+
+  test("reads the logged-in user's login", () => {
+    expect(parseSearchPage(page([], { current_user: { id: 1, login: "ana" } })).login).toBe("ana");
+    expect(parseSearchPage(page([])).login).toBeNull();
   });
 
   test("returns the route error message", () => {
@@ -366,22 +376,22 @@ describe("isSsoWall", () => {
   });
 });
 
+const pr = (repo: string, number: number): Pr => ({
+  id: `${repo}#${number}`,
+  number,
+  title: "Add thing",
+  url: `https://github.com/${repo}/pull/${number}`,
+  repo,
+  author: "ana",
+  isDraft: false,
+  updatedAt: "2026-10-18T10:00:00Z",
+  ci: "none",
+  checks: null,
+  review: "none",
+});
+
 describe("findSsoBlockedOrgs", () => {
   afterEach(() => mock.restore());
-
-  const pr = (repo: string, number: number): Pr => ({
-    id: `${repo}#${number}`,
-    number,
-    title: "Add thing",
-    url: `https://github.com/${repo}/pull/${number}`,
-    repo,
-    author: "ana",
-    isDraft: false,
-    updatedAt: "2026-10-18T10:00:00Z",
-    ci: "none",
-    checks: null,
-    review: "none",
-  });
 
   test("checks one PR page per org that uses SSO", async () => {
     const requested: string[] = [];
@@ -404,6 +414,212 @@ describe("findSsoBlockedOrgs", () => {
   test("treats failed checks as not blocked", async () => {
     stubFetch(() => Promise.reject(new TypeError("Failed to fetch")));
     expect(await findSsoBlockedOrgs([pr("acme/web", 1)])).toEqual([]);
+  });
+});
+
+// The message GitHub returns for a search naming an org whose IP allow list blocks the user
+const ipError = (org: string) =>
+  `Access to the requested organization (${org}) is blocked by an IP allow list. Your session or token ` +
+  "does not satisfy the organization's or enterprise's conditional access policies. Confirm the policy " +
+  "requirements are met, then try again.";
+
+// Trimmed from GitHub's dashboard context switcher: the user's own dashboard, then one entry per org
+const contextList = (orgs: string[]) =>
+  '<action-list><ul aria-label="dashboards" role="listbox">' +
+  '<li><a href="/" role="option" aria-selected="true">ana</a></li>' +
+  orgs.map((org) => `<li><a href="/orgs/${org}/dashboard" role="option">${org}</a></li>`).join("") +
+  "</ul></action-list>";
+
+const searchReply = (error: string | null) =>
+  Response.json({
+    meta: { title: "Pull requests" },
+    payload: {
+      pullsDashboardSurfaceContentRoute: {
+        results: [],
+        pageInfo: { currentPage: 1, totalPages: 0, totalCount: 0 },
+        error,
+      },
+    },
+  });
+
+const searchedOrg = (url: string) => /org:(\S+)/.exec(new URL(url).searchParams.get("q") ?? "")?.[1] ?? null;
+
+const searchedOrgs = (requested: string[]) =>
+  requested.filter((url) => url.includes("/pulls/search")).map(searchedOrg);
+
+const fakeIpGithub =
+  (memberOrgs: string[], blocked: string[], requested: string[] = []) =>
+  (url: string) => {
+    requested.push(url);
+    if (url.includes("/dashboard/ajax_context_list")) return new Response(contextList(memberOrgs));
+    const org = searchedOrg(url) ?? "";
+    return searchReply(blocked.includes(org) ? ipError(org) : null);
+  };
+
+describe("ipBlockedOrgOf", () => {
+  test("reads the org from GitHub's IP allow list error", () => {
+    expect(ipBlockedOrgOf(ipError("sanalabs"))).toBe("sanalabs");
+  });
+
+  test("returns null for other search errors", () => {
+    expect(ipBlockedOrgOf("Search timed out")).toBeNull();
+  });
+});
+
+describe("parseMemberOrgs", () => {
+  test("reads org logins from the dashboard context switcher", () => {
+    const html = contextList(["k2k-development", "sanalabs", "SU-CS308-22FA", "sanalabs"]);
+    expect(parseMemberOrgs(html)).toEqual(["k2k-development", "sanalabs", "SU-CS308-22FA"]);
+  });
+
+  test("returns no orgs for a user without any", () => {
+    expect(parseMemberOrgs(contextList([]))).toEqual([]);
+  });
+});
+
+describe("checkIpAllowLists", () => {
+  afterEach(() => mock.restore());
+
+  const ORGS = ["k2k-development", "sanalabs", "SU-CS308-22FA"];
+  const members = { login: "ana", orgs: ORGS, fetchedAt: NOW };
+  const checked: PanelState = { ...EMPTY_PANEL, memberOrgs: members, ipCheckedAt: NOW };
+
+  test("searches each org without PRs once and reports the blocked ones", async () => {
+    const requested: string[] = [];
+    stubFetch(fakeIpGithub(ORGS, ["sanalabs"], requested));
+    const result = await checkIpAllowLists(EMPTY_PANEL, "ana", [pr("K2K-Development/web", 1)], true, NOW);
+    expect(result).toEqual({ ipBlockedOrgs: ["sanalabs"], ipCheckedAt: NOW, memberOrgs: members, retryAt: null });
+    expect(requested[0]).toBe("https://github.com/dashboard/ajax_context_list?current_context=ana");
+    expect(searchedOrgs(requested)).toEqual(["sanalabs", "SU-CS308-22FA"]);
+    expect(new URL(requested[1] ?? "").searchParams.get("q")).toBe("is:pr org:sanalabs created:<2008-01-01");
+  });
+
+  test("sends nothing before the interval is up, but clears an org whose PRs are back", async () => {
+    const requested: string[] = [];
+    stubFetch(fakeIpGithub(ORGS, [], requested));
+    const previous = { ...checked, ipBlockedOrgs: ["sanalabs", "SU-CS308-22FA"] };
+    const later = NOW + IP_CHECK_INTERVAL_MS - 1;
+    const result = await checkIpAllowLists(previous, "ana", [pr("sanalabs/web", 1)], true, later);
+    expect(requested).toEqual([]);
+    expect(result).toEqual({
+      ipBlockedOrgs: ["SU-CS308-22FA"],
+      ipCheckedAt: NOW,
+      memberOrgs: members,
+      retryAt: null,
+    });
+  });
+
+  test("checks only the orgs whose PRs all disappeared before the interval is up", async () => {
+    const requested: string[] = [];
+    stubFetch(fakeIpGithub(ORGS, ["sanalabs"], requested));
+    const previous = { ...checked, ipBlockedOrgs: ["SU-CS308-22FA"], mine: { prs: [pr("sanalabs/web", 1)], totalCount: 1 } };
+    const result = await checkIpAllowLists(previous, "ana", [], true, NOW + 1);
+    expect(searchedOrgs(requested)).toEqual(["sanalabs"]);
+    expect(result.ipBlockedOrgs).toEqual(["SU-CS308-22FA", "sanalabs"]);
+    // The interval still counts from the last full check
+    expect(result.ipCheckedAt).toBe(NOW);
+  });
+
+  test("doesn't check early when the results are incomplete", async () => {
+    const requested: string[] = [];
+    stubFetch(fakeIpGithub(ORGS, ["sanalabs"], requested));
+    const previous = { ...checked, mine: { prs: [pr("sanalabs/web", 1)], totalCount: 1 } };
+    const result = await checkIpAllowLists(previous, "ana", [], false, NOW + 1);
+    expect(requested).toEqual([]);
+    expect(result.ipBlockedOrgs).toEqual([]);
+  });
+
+  test("doesn't check early when a personal repo's PRs disappear", async () => {
+    const requested: string[] = [];
+    stubFetch(fakeIpGithub(ORGS, [], requested));
+    const previous = { ...checked, mine: { prs: [pr("ana/dotfiles", 1)], totalCount: 1 } };
+    await checkIpAllowLists(previous, "ana", [], true, NOW + 1);
+    expect(requested).toEqual([]);
+  });
+
+  test("checks the new account's orgs right away after switching accounts", async () => {
+    const requested: string[] = [];
+    stubFetch(fakeIpGithub(["globex"], ["globex"], requested));
+    const previous = { ...checked, ipBlockedOrgs: ["sanalabs"] };
+    const result = await checkIpAllowLists(previous, "bob", [], true, NOW + 1);
+    expect(requested[0]).toBe("https://github.com/dashboard/ajax_context_list?current_context=bob");
+    expect(result).toEqual({
+      ipBlockedOrgs: ["globex"],
+      ipCheckedAt: NOW + 1,
+      memberOrgs: { login: "bob", orgs: ["globex"], fetchedAt: NOW + 1 },
+      retryAt: null,
+    });
+  });
+
+  test("drops the old account's blocks when the new account's orgs can't be loaded", async () => {
+    stubFetch(() => new Response("Not Found", { status: 404 }));
+    const previous = { ...checked, ipBlockedOrgs: ["sanalabs"] };
+    const result = await checkIpAllowLists(previous, "bob", [], true, NOW + 1);
+    expect(result).toEqual({ ipBlockedOrgs: [], ipCheckedAt: NOW + 1, memberOrgs: null, retryAt: null });
+  });
+
+  test("reuses the org list until it expires", async () => {
+    const due = NOW + IP_CHECK_INTERVAL_MS;
+    const listFetches = async (login: string, now: number) => {
+      const requested: string[] = [];
+      stubFetch(fakeIpGithub(ORGS, [], requested));
+      await checkIpAllowLists(checked, login, [], true, now);
+      mock.restore();
+      return requested.filter((url) => url.includes("ajax_context_list")).length;
+    };
+    expect(await listFetches("ana", due)).toBe(0);
+    expect(await listFetches("ANA", due)).toBe(0);
+    expect(await listFetches("ana", NOW + MEMBER_ORGS_TTL_MS)).toBe(1);
+  });
+
+  test("stops checking at the first rate limit and reports when to retry", async () => {
+    const orgs = ["a", "b", "c", "d", "e", "f"];
+    const requested: string[] = [];
+    stubFetch((url) => {
+      requested.push(url);
+      if (url.includes("ajax_context_list")) return new Response(contextList(orgs));
+      if (url.includes("org%3Ab+") || url.includes("org%3Ab%20")) {
+        return new Response(null, { status: 429, headers: { "retry-after": "60" } });
+      }
+      return fakeIpGithub(orgs, ["c"])(url);
+    });
+    const previous = { ...EMPTY_PANEL, ipBlockedOrgs: ["e"] };
+    const before = Date.now();
+    const result = await checkIpAllowLists(previous, "ana", [], true, NOW);
+    // Only the first batch of 4 went out; e and f were never searched
+    expect(searchedOrgs(requested)).toEqual(["a", "b", "c", "d"]);
+    expect(result.retryAt).toBeGreaterThanOrEqual(before + 60_000);
+    // Unchecked orgs keep their last state
+    expect(result.ipBlockedOrgs).toEqual(["c", "e"]);
+    expect(result.ipCheckedAt).toBe(NOW);
+  });
+
+  test("keeps an org's last state when its search fails", async () => {
+    stubFetch((url) => {
+      if (url.includes("org%3Asanalabs")) return Promise.reject(new TypeError("Failed to fetch"));
+      return fakeIpGithub(ORGS, [])(url);
+    });
+    const previous = { ...checked, ipBlockedOrgs: ["sanalabs", "k2k-development"], ipCheckedAt: null };
+    const result = await checkIpAllowLists(previous, "ana", [], true, NOW);
+    expect(result.ipBlockedOrgs).toEqual(["sanalabs"]);
+  });
+
+  test("waits for the next interval when the org list can't be loaded", async () => {
+    const requested: string[] = [];
+    stubFetch((url) => {
+      requested.push(url);
+      return new Response("Not Found", { status: 404 });
+    });
+    const result = await checkIpAllowLists(EMPTY_PANEL, "ana", [], true, NOW);
+    expect(result).toEqual({ ipBlockedOrgs: [], ipCheckedAt: NOW, memberOrgs: null, retryAt: null });
+    expect(requested).toHaveLength(1);
+  });
+
+  test("sends nothing without a login", async () => {
+    const requested: string[] = [];
+    stubFetch(fakeIpGithub(ORGS, [], requested));
+    await checkIpAllowLists(EMPTY_PANEL, null, [], true, NOW);
+    expect(requested).toEqual([]);
   });
 });
 
@@ -460,6 +676,54 @@ describe("fetchPanel", () => {
     expect(panel.review?.prs.map((pr) => pr.id)).toEqual(["PR_1"]);
     expect(panel.ssoOrgs).toEqual(["acme"]);
     expect(panel.error).toBeNull();
+  });
+
+  test("shows a search naming an IP-blocked org as that org's banner, not a search error", async () => {
+    stubFetch((url) => {
+      if (url.includes("/pulls/deferred")) {
+        return Response.json({ payload: { pullsDashboardSurfaceContentDeferredData: { results: [] } } });
+      }
+      const sso = { sso_organizations: ["sanalabs"] };
+      if (url.includes("mine-query")) return new Response(html(page([], sso, ipError("sanalabs"))));
+      return new Response(html(page([], sso)));
+    });
+    const panel = await fetchPanel(queries, EMPTY_PANEL);
+    expect(panel.error).toBeNull();
+    expect(panel.ipBlockedOrgs).toEqual(["sanalabs"]);
+    expect(panel.ssoOrgs).toEqual([]);
+  });
+
+  test("checks the logged-in user's orgs for IP allow lists", async () => {
+    const ipGithub = fakeIpGithub(["acme", "sanalabs"], ["sanalabs"]);
+    stubFetch((url) => {
+      if (url.endsWith("/sso_status.json")) return Response.json({ error: "Not Found" }, { status: 404 });
+      if (url.includes("/pulls/deferred")) {
+        return Response.json({ payload: { pullsDashboardSurfaceContentDeferredData: { results: [] } } });
+      }
+      const app = { sso_organizations: [], current_user: { login: "ana" } };
+      if (url.includes("review-query")) return new Response(html(page([item()], app)));
+      if (url.includes("mine-query")) return new Response(html(page([], app)));
+      return ipGithub(url);
+    });
+    const panel = await fetchPanel(queries, EMPTY_PANEL);
+    expect(panel.ipBlockedOrgs).toEqual(["sanalabs"]);
+    expect(panel.memberOrgs?.orgs).toEqual(["acme", "sanalabs"]);
+    expect(panel.ipCheckedAt).not.toBeNull();
+  });
+
+  test("reports a rate limit hit during the IP checks, so refreshes pause", async () => {
+    stubFetch((url) => {
+      if (url.includes("/pulls/deferred")) {
+        return Response.json({ payload: { pullsDashboardSurfaceContentDeferredData: { results: [] } } });
+      }
+      const app = { sso_organizations: [], current_user: { login: "ana" } };
+      if (url.includes("review-query") || url.includes("mine-query")) return new Response(html(page([], app)));
+      if (url.includes("ajax_context_list")) return new Response(contextList(["sanalabs"]));
+      return new Response(null, { status: 429, headers: { "retry-after": "60" } });
+    });
+    const panel = await fetchPanel(queries, EMPTY_PANEL);
+    expect(panel.error?.kind).toBe("rate_limited");
+    expect(panel.review).toEqual({ prs: [], totalCount: 0 });
   });
 
   test("clears the old PRs when logged out", async () => {

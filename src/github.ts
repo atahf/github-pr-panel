@@ -2,6 +2,7 @@ import { EMPTY_PANEL, GITHUB_ORIGIN, searchUrl, UNKNOWN_ORG } from "~/constants"
 import type {
   CheckCounts,
   CiState,
+  MemberOrgs,
   PanelError,
   PanelState,
   Pr,
@@ -139,6 +140,7 @@ export const parseSearchPage = (data: unknown) => {
   if (!Array.isArray(route.results)) throw new FormatError("route.results is missing");
   if (!isRec(route.pageInfo)) throw new FormatError("route.pageInfo is missing");
   const sso = at(data, "appPayload", "sso_organizations");
+  const login = at(data, "appPayload", "current_user", "login");
   const totalPages = route.pageInfo.totalPages;
   return {
     items: route.results.map(parseItem),
@@ -147,6 +149,7 @@ export const parseSearchPage = (data: unknown) => {
     totalPages: isNumber(totalPages) ? totalPages : 1,
     routeError: routeErrorMessage(route.error),
     ssoOrgs: Array.isArray(sso) ? sso.map(ssoOrgName) : null,
+    login: isString(login) ? login : null,
   };
 };
 
@@ -198,16 +201,16 @@ export const toPanelError = (error: unknown): PanelError => {
   return { kind: "failed", detail: error instanceof Error ? error.message : String(error) };
 };
 
-const githubFetch = (url: string, accept: string) =>
+const githubFetch = (url: string, accept: string, headers: Record<string, string> = {}) =>
   fetch(url, {
     credentials: "include",
     redirect: "manual",
-    headers: { Accept: accept },
+    headers: { Accept: accept, ...headers },
     signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
   });
 
-const request = async (url: string, accept: string) => {
-  const res = await githubFetch(url, accept).catch(() => {
+const request = async (url: string, accept: string, headers: Record<string, string> = {}) => {
+  const res = await githubFetch(url, accept, headers).catch(() => {
     throw new GithubError({ kind: "offline" });
   });
   const error = classifyResponse(res);
@@ -295,6 +298,131 @@ export const findSsoBlockedOrgs = async (prs: Pr[]) => {
   return orgs.filter((_, i) => blocked[i]).map(([org]) => org);
 };
 
+// IP allow list checks
+
+// Each check sends one search per org, so it runs far less often than the PR refresh
+export const IP_CHECK_INTERVAL_MS = 15 * 60_000;
+export const MEMBER_ORGS_TTL_MS = 24 * 60 * 60_000;
+
+// A few searches at a time, so members of many orgs don't send a burst
+const IP_CHECK_CONCURRENCY = 4;
+
+const IP_BLOCKED_RE = /organization \((.+?)\) is blocked by an IP allow list/;
+const MEMBER_ORG_RE = /href="\/orgs\/([^/"]+)\/dashboard"/g;
+
+type IpCheck = Pick<PanelState, "ipBlockedOrgs" | "ipCheckedAt" | "memberOrgs"> & { retryAt: number | null };
+
+const lowerSet = (orgs: string[]) => new Set(orgs.map((org) => org.toLowerCase()));
+
+const uniqueOrgs = (orgs: string[]) => [...new Map(orgs.map((org) => [org.toLowerCase(), org])).values()];
+
+export const ipBlockedOrgOf = (routeError: string) => IP_BLOCKED_RE.exec(routeError)?.[1] ?? null;
+
+// The dashboard context switcher lists the user's orgs as /orgs/<org>/dashboard links
+export const parseMemberOrgs = (html: string) =>
+  uniqueOrgs([...html.matchAll(MEMBER_ORG_RE)].map((match) => match[1] ?? "").filter((org) => org !== ""));
+
+const fetchMemberOrgs = async (login: string, now: number): Promise<MemberOrgs> => {
+  const url = `${GITHUB_ORIGIN}/dashboard/ajax_context_list?current_context=${encodeURIComponent(login)}`;
+  const res = await request(url, "text/fragment+html", { "X-Requested-With": "XMLHttpRequest" });
+  return { login, orgs: parseMemberOrgs(await res.text()), fetchedAt: now };
+};
+
+const memberOrgsFor = async (login: string, cached: MemberOrgs | null, now: number) => {
+  const usable = cached !== null && cached.login.toLowerCase() === login.toLowerCase() ? cached : null;
+  if (usable && now - usable.fetchedAt < MEMBER_ORGS_TTL_MS) return usable;
+  return fetchMemberOrgs(login, now).catch(() => usable);
+};
+
+// Searches that span several orgs leave out an IP-blocked one without saying so, but a search
+// naming only that org reports the block. The date filter matches nothing, so the reply stays tiny
+const isIpBlocked = async (org: string) => {
+  try {
+    const res = await request(searchUrl(`is:pr org:${org} created:<2008-01-01`), "application/json");
+    const route = at(await res.json(), "payload", "pullsDashboardSurfaceContentRoute");
+    if (!isRec(route)) return null;
+    return isString(route.error) && ipBlockedOrgOf(route.error) !== null;
+  } catch (e) {
+    // A rate limit has to stop the remaining checks, not just count as one failed check
+    if (e instanceof GithubError && e.panelError.kind === "rate_limited") throw e;
+    return null;
+  }
+};
+
+// Stops at the first rate limit; orgs left unchecked get null, like a failed check
+const checkOrgs = async (orgs: string[]) => {
+  const results: (boolean | null)[] = orgs.map(() => null);
+  for (let i = 0; i < orgs.length; i += IP_CHECK_CONCURRENCY) {
+    const batch = await Promise.allSettled(orgs.slice(i, i + IP_CHECK_CONCURRENCY).map(isIpBlocked));
+    batch.forEach((result, j) => {
+      if (result.status === "fulfilled") results[i + j] = result.value;
+    });
+    const limited = batch.find((result) => result.status === "rejected");
+    if (limited) {
+      const error = toPanelError(limited.reason);
+      return { results, retryAt: error.kind === "rate_limited" ? error.retryAt : null };
+    }
+  }
+  return { results, retryAt: null };
+};
+
+const prsOf = ({ review, mine }: Pick<PanelState, "review" | "mine">) => [
+  ...(review?.prs ?? []),
+  ...(mine?.prs ?? []),
+];
+
+// Orgs with PRs in the results are reachable and never checked. Between full checks, only an org
+// whose PRs all disappeared is checked, since it may have just become blocked. That needs complete
+// results: PRs missing from a failed page or past the page limit didn't disappear
+export const checkIpAllowLists = async (
+  previous: PanelState,
+  login: string | null,
+  prs: Pr[],
+  complete: boolean,
+  now = Date.now(),
+): Promise<IpCheck> => {
+  const reachable = lowerSet(prs.map(ownerOf));
+  const isReachable = (org: string) => reachable.has(org.toLowerCase());
+  // Switching accounts without logging out leaves the other account's orgs and blocks behind
+  const switched =
+    login !== null &&
+    previous.memberOrgs !== null &&
+    previous.memberOrgs.login.toLowerCase() !== login.toLowerCase();
+  const wasBlocked = switched ? [] : previous.ipBlockedOrgs;
+  const kept: IpCheck = {
+    ipBlockedOrgs: wasBlocked.filter((org) => !isReachable(org)),
+    ipCheckedAt: previous.ipCheckedAt,
+    memberOrgs: switched ? null : previous.memberOrgs,
+    retryAt: null,
+  };
+  if (login === null) return kept;
+
+  const due = switched || previous.ipCheckedAt === null || now - previous.ipCheckedAt >= IP_CHECK_INTERVAL_MS;
+  if (!due) {
+    const hadPrs = lowerSet(prsOf(previous).map(ownerOf));
+    const vanished = complete
+      ? (kept.memberOrgs?.orgs ?? []).filter((org) => hadPrs.has(org.toLowerCase()) && !isReachable(org))
+      : [];
+    if (vanished.length === 0) return kept;
+    const { results, retryAt } = await checkOrgs(vanished);
+    const newlyBlocked = vanished.filter((_, i) => results[i]);
+    return { ...kept, ipBlockedOrgs: uniqueOrgs([...kept.ipBlockedOrgs, ...newlyBlocked]), retryAt };
+  }
+
+  const memberOrgs = await memberOrgsFor(login, kept.memberOrgs, now);
+  if (memberOrgs === null) return { ...kept, ipCheckedAt: now };
+  const candidates = memberOrgs.orgs.filter((org) => !isReachable(org));
+  const { results, retryAt } = await checkOrgs(candidates);
+  // A failed or skipped check keeps the org's last known state
+  const blockedBefore = lowerSet(wasBlocked);
+  return {
+    ipBlockedOrgs: candidates.filter((org, i) => results[i] ?? blockedBefore.has(org.toLowerCase())),
+    ipCheckedAt: now,
+    memberOrgs,
+    retryAt,
+  };
+};
+
 // A PR updated while the pages load can move to the next page and show up twice
 const uniqueById = (prs: Pr[]) => [...new Map(prs.map((pr) => [pr.id, pr])).values()];
 
@@ -308,20 +436,40 @@ export const fetchSection = async (query: string) => {
     .slice(0, failed === -1 ? undefined : failed)
     .flatMap((result) => (result.status === "fulfilled" ? result.value.prs : []));
   const section: Section = { prs: uniqueById([...first.prs, ...loaded]), totalCount: first.totalCount };
-  return { section, routeError: first.routeError, ssoOrgs: first.ssoOrgs };
+  return { section, routeError: first.routeError, ssoOrgs: first.ssoOrgs, login: first.login };
 };
 
 export const fetchPanel = async (queries: Queries, previous: PanelState): Promise<PanelState> => {
   try {
     const [review, mine] = await Promise.all([fetchSection(queries.review), fetchSection(queries.mine)]);
-    const routeError = review.routeError ?? mine.routeError;
-    const blockedOrgs = await findSsoBlockedOrgs([...review.section.prs, ...mine.section.prs]);
+    const routeErrors = [review.routeError, mine.routeError].filter((error) => error !== null);
+    // A query that names an IP-blocked org fails with a message naming it, which gets its own banner
+    const searchBlocked = routeErrors.map(ipBlockedOrgOf).filter((org) => org !== null);
+    const routeError = routeErrors.find((error) => ipBlockedOrgOf(error) === null);
+    const prs = [...review.section.prs, ...mine.section.prs];
+    const complete = !routeError && [review, mine].every(({ section }) => section.prs.length >= section.totalCount);
+    const [ssoBlocked, { retryAt, ...ip }] = await Promise.all([
+      findSsoBlockedOrgs(prs),
+      checkIpAllowLists(previous, review.login ?? mine.login, prs, complete),
+    ]);
+    const ipBlockedOrgs = uniqueOrgs([...ip.ipBlockedOrgs, ...searchBlocked]);
+    const ipBlocked = lowerSet(ipBlockedOrgs);
+    const ssoOrgs = [...new Set([...(review.ssoOrgs ?? []), ...(mine.ssoOrgs ?? []), ...ssoBlocked])];
+    // A rate limit during the IP checks pauses refreshes like any other rate limit
+    const error: PanelError | null =
+      retryAt !== null
+        ? { kind: "rate_limited", retryAt }
+        : routeError
+          ? { kind: "search_error", message: routeError }
+          : null;
     return {
       review: review.section,
       mine: mine.section,
-      error: routeError ? { kind: "search_error", message: routeError } : null,
-      ssoOrgs: [...new Set([...(review.ssoOrgs ?? []), ...(mine.ssoOrgs ?? []), ...blockedOrgs])],
+      error,
+      ssoOrgs: ssoOrgs.filter((org) => !ipBlocked.has(org.toLowerCase())),
       ssoUnknown: review.ssoOrgs === null || mine.ssoOrgs === null,
+      ...ip,
+      ipBlockedOrgs,
       fetchedAt: Date.now(),
       refreshing: false,
     };

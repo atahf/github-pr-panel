@@ -25,12 +25,17 @@ const setBadge = async (text: string, color: string, title: string) => {
   ]);
 };
 
+// IP-blocked orgs only go in the tooltip, since the user can't fix them from here
+const ipNoteOf = ({ ipBlockedOrgs }: PanelState) =>
+  ipBlockedOrgs.length > 0 ? ` · PRs hidden by IP allow list: ${ipBlockedOrgs.join(", ")}` : "";
+
 const updateBadge = async (panel: PanelState) => {
   const warning = warningOf(panel);
-  if (warning) return setBadge("!", WARNING_COLOR, `PR Panel: ${warning}`);
+  const ipNote = ipNoteOf(panel);
+  if (warning) return setBadge("!", WARNING_COLOR, `PR Panel: ${warning}${ipNote}`);
   const count = panel.review?.totalCount ?? 0;
-  if (count === 0) return setBadge("", NEUTRAL_COLOR, "PR Panel");
-  return setBadge(String(count), NEUTRAL_COLOR, `PR Panel: ${count} review requests`);
+  if (count === 0) return setBadge("", NEUTRAL_COLOR, `PR Panel${ipNote}`);
+  return setBadge(String(count), NEUTRAL_COLOR, `PR Panel: ${count} review requests${ipNote}`);
 };
 
 // Refresh

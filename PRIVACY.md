@@ -3,7 +3,8 @@
 PR Panel for GitHub uses your existing GitHub session to refresh PRs and statuses in the background,
 including private repositories you can access. It does not read or store raw cookies, passwords, or tokens.
 
-PR metadata, usernames, SSO/error details, queries, and settings are stored locally, not synced.
+PR metadata, usernames, the names of your organizations, SSO/IP allow list/error details, queries, and
+settings are stored locally, not synced.
 Clicking a PR checks matching open GitHub tab URLs to focus it; no browsing log is kept.
 
 Search terms, PR identifiers, and avatar requests go to GitHub and its image hosts, which receive

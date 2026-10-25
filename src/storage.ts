@@ -15,6 +15,7 @@ export const read = async <K extends keyof Store>(key: K): Promise<Store[K] | un
 
 export const write = (items: Partial<Store>) => chrome.storage.local.set(items);
 
-export const readPanel = async () => (await read("panel")) ?? EMPTY_PANEL;
+// A panel stored by an older version is missing newer fields
+export const readPanel = async (): Promise<PanelState> => ({ ...EMPTY_PANEL, ...(await read("panel")) });
 
 export const readSettings = async () => sanitizeSettings(await read("settings"));
