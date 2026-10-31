@@ -335,17 +335,23 @@ const memberOrgsFor = async (login: string, cached: MemberOrgs | null, now: numb
 };
 
 // Searches that span several orgs leave out an IP-blocked one without saying so, but a search
-// naming only that org reports the block. The date filter matches nothing, so the reply stays tiny
+// naming only that org reports the block. The date filter matches nothing, so the reply stays tiny.
+// Only that report counts as blocked: an expired SSO session may get a redirect, an error or a sign-in
+// page instead, and treating those as failed checks would keep a lifted block and hide the SSO banner.
+// Null means no answer, from a network failure or a server error
 const isIpBlocked = async (org: string) => {
   try {
-    const res = await request(searchUrl(`is:pr org:${org} created:<2008-01-01`), "application/json");
-    const route = at(await res.json(), "payload", "pullsDashboardSurfaceContentRoute");
-    if (!isRec(route)) return null;
-    return isString(route.error) && ipBlockedOrgOf(route.error) !== null;
-  } catch (e) {
+    const res = await githubFetch(searchUrl(`is:pr org:${org} created:<2008-01-01`), "application/json");
+    const error = classifyResponse(res);
     // A rate limit has to stop the remaining checks, not just count as one failed check
-    if (e instanceof GithubError && e.panelError.kind === "rate_limited") throw e;
-    return null;
+    if (error?.kind === "rate_limited") throw new GithubError(error);
+    if (res.status >= 500) return null;
+    if (error) return false;
+    const route = at(await res.json(), "payload", "pullsDashboardSurfaceContentRoute");
+    return isRec(route) && isString(route.error) && ipBlockedOrgOf(route.error) !== null;
+  } catch (e) {
+    if (e instanceof GithubError) throw e;
+    return e instanceof SyntaxError ? false : null;
   }
 };
 
@@ -371,9 +377,10 @@ const prsOf = ({ review, mine }: Pick<PanelState, "review" | "mine">) => [
   ...(mine?.prs ?? []),
 ];
 
-// Orgs with PRs in the results are reachable and never checked. Between full checks, only an org
-// whose PRs all disappeared is checked, since it may have just become blocked. That needs complete
-// results: PRs missing from a failed page or past the page limit didn't disappear
+// Orgs with PRs in the results are reachable and never checked. Between full checks, only two kinds
+// of org are checked: a blocked one, since a VPN can lift the block at any time and its PRs may stay
+// hidden by expired SSO, and one whose PRs all disappeared, since it may have just become blocked.
+// The second needs complete results: PRs missing from a failed page or past the page limit didn't disappear
 export const checkIpAllowLists = async (
   previous: PanelState,
   login: string | null,
@@ -403,10 +410,16 @@ export const checkIpAllowLists = async (
     const vanished = complete
       ? (kept.memberOrgs?.orgs ?? []).filter((org) => hadPrs.has(org.toLowerCase()) && !isReachable(org))
       : [];
-    if (vanished.length === 0) return kept;
-    const { results, retryAt } = await checkOrgs(vanished);
-    const newlyBlocked = vanished.filter((_, i) => results[i]);
-    return { ...kept, ipBlockedOrgs: uniqueOrgs([...kept.ipBlockedOrgs, ...newlyBlocked]), retryAt };
+    const orgs = uniqueOrgs([...kept.ipBlockedOrgs, ...vanished]);
+    if (orgs.length === 0) return kept;
+    const { results, retryAt } = await checkOrgs(orgs);
+    // A failed or skipped check keeps the org's last known state
+    const blockedBefore = lowerSet(kept.ipBlockedOrgs);
+    return {
+      ...kept,
+      ipBlockedOrgs: orgs.filter((org, i) => results[i] ?? blockedBefore.has(org.toLowerCase())),
+      retryAt,
+    };
   }
 
   const memberOrgs = await memberOrgsFor(login, kept.memberOrgs, now);

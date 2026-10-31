@@ -494,30 +494,74 @@ describe("checkIpAllowLists", () => {
     expect(new URL(requested[1] ?? "").searchParams.get("q")).toBe("is:pr org:sanalabs created:<2008-01-01");
   });
 
-  test("sends nothing before the interval is up, but clears an org whose PRs are back", async () => {
+  test("sends nothing before the interval is up when no org is blocked or disappeared", async () => {
     const requested: string[] = [];
     stubFetch(fakeIpGithub(ORGS, [], requested));
-    const previous = { ...checked, ipBlockedOrgs: ["sanalabs", "SU-CS308-22FA"] };
     const later = NOW + IP_CHECK_INTERVAL_MS - 1;
-    const result = await checkIpAllowLists(previous, "ana", [pr("sanalabs/web", 1)], true, later);
+    const result = await checkIpAllowLists(checked, "ana", [pr("sanalabs/web", 1)], true, later);
     expect(requested).toEqual([]);
-    expect(result).toEqual({
-      ipBlockedOrgs: ["SU-CS308-22FA"],
-      ipCheckedAt: NOW,
-      memberOrgs: members,
-      retryAt: null,
-    });
+    expect(result).toEqual({ ipBlockedOrgs: [], ipCheckedAt: NOW, memberOrgs: members, retryAt: null });
   });
 
-  test("checks only the orgs whose PRs all disappeared before the interval is up", async () => {
+  test("clears an org whose PRs are back without searching for it", async () => {
     const requested: string[] = [];
-    stubFetch(fakeIpGithub(ORGS, ["sanalabs"], requested));
-    const previous = { ...checked, ipBlockedOrgs: ["SU-CS308-22FA"], mine: { prs: [pr("sanalabs/web", 1)], totalCount: 1 } };
+    stubFetch(fakeIpGithub(ORGS, ["SU-CS308-22FA"], requested));
+    const previous = { ...checked, ipBlockedOrgs: ["sanalabs", "SU-CS308-22FA"] };
+    const result = await checkIpAllowLists(previous, "ana", [pr("sanalabs/web", 1)], true, NOW + 1);
+    expect(searchedOrgs(requested)).toEqual(["SU-CS308-22FA"]);
+    expect(result.ipBlockedOrgs).toEqual(["SU-CS308-22FA"]);
+  });
+
+  test("checks blocked orgs and orgs whose PRs all disappeared before the interval is up", async () => {
+    const requested: string[] = [];
+    stubFetch(fakeIpGithub(ORGS, ["SU-CS308-22FA", "sanalabs"], requested));
+    const previous = {
+      ...checked,
+      ipBlockedOrgs: ["SU-CS308-22FA"],
+      mine: { prs: [pr("sanalabs/web", 1)], totalCount: 1 },
+    };
     const result = await checkIpAllowLists(previous, "ana", [], true, NOW + 1);
-    expect(searchedOrgs(requested)).toEqual(["sanalabs"]);
+    expect(searchedOrgs(requested)).toEqual(["SU-CS308-22FA", "sanalabs"]);
     expect(result.ipBlockedOrgs).toEqual(["SU-CS308-22FA", "sanalabs"]);
     // The interval still counts from the last full check
     expect(result.ipCheckedAt).toBe(NOW);
+  });
+
+  test("clears a lifted block on the next refresh, even with incomplete results", async () => {
+    stubFetch(fakeIpGithub(ORGS, []));
+    const previous = { ...checked, ipBlockedOrgs: ["sanalabs"] };
+    const result = await checkIpAllowLists(previous, "ana", [], false, NOW + 1);
+    expect(result.ipBlockedOrgs).toEqual([]);
+    expect(result.ipCheckedAt).toBe(NOW);
+  });
+
+  const blockedSanalabs = { ...checked, ipBlockedOrgs: ["sanalabs"] };
+
+  const notAnIpBlock: [string, () => Response][] = [
+    ["a redirect", () => Object.defineProperty(new Response(null), "type", { value: "opaqueredirect" })],
+    ["an HTTP error", () => new Response(null, { status: 403 })],
+    ["a sign-in page", () => new Response("<html><body class='session-authentication'></body></html>")],
+    ["JSON without search results", () => Response.json({})],
+  ];
+
+  for (const [name, reply] of notAnIpBlock) {
+    test(`clears a blocked org when its search answers with ${name}`, async () => {
+      stubFetch(reply);
+      const result = await checkIpAllowLists(blockedSanalabs, "ana", [], true, NOW + 1);
+      expect(result.ipBlockedOrgs).toEqual([]);
+    });
+  }
+
+  test("keeps a blocked org when its search gets a server error", async () => {
+    stubFetch(() => new Response(null, { status: 503 }));
+    const result = await checkIpAllowLists(blockedSanalabs, "ana", [], true, NOW + 1);
+    expect(result.ipBlockedOrgs).toEqual(["sanalabs"]);
+  });
+
+  test("keeps a blocked org when its search fails before the interval is up", async () => {
+    stubFetch(() => Promise.reject(new TypeError("Failed to fetch")));
+    const result = await checkIpAllowLists(blockedSanalabs, "ana", [], true, NOW + 1);
+    expect(result.ipBlockedOrgs).toEqual(["sanalabs"]);
   });
 
   test("doesn't check early when the results are incomplete", async () => {
@@ -689,6 +733,33 @@ describe("fetchPanel", () => {
     });
     const panel = await fetchPanel(queries, EMPTY_PANEL);
     expect(panel.error).toBeNull();
+    expect(panel.ipBlockedOrgs).toEqual(["sanalabs"]);
+    expect(panel.ssoOrgs).toEqual([]);
+  });
+
+  // A refresh soon after a full check, with the org hidden from search and listed as needing SSO
+  const panelWithIpBlock = (singleOrgReply: () => Response) => {
+    const app = { sso_organizations: ["sanalabs"], current_user: { login: "ana" } };
+    const searchPage = () => new Response(html(page([], app)));
+    stubFetch((url) => (url.includes("org%3Asanalabs") ? singleOrgReply() : searchPage()));
+    return fetchPanel(queries, {
+      ...previous,
+      ipBlockedOrgs: ["sanalabs"],
+      ipCheckedAt: Date.now(),
+      memberOrgs: { login: "ana", orgs: ["sanalabs"], fetchedAt: Date.now() },
+    });
+  };
+
+  test("shows expired SSO as soon as a VPN lifts an org's IP block", async () => {
+    const panel = await panelWithIpBlock(() =>
+      Object.defineProperty(new Response(null), "type", { value: "opaqueredirect" }),
+    );
+    expect(panel.ipBlockedOrgs).toEqual([]);
+    expect(panel.ssoOrgs).toEqual(["sanalabs"]);
+  });
+
+  test("keeps hiding the SSO banner while GitHub still reports the IP block", async () => {
+    const panel = await panelWithIpBlock(() => searchReply(ipError("sanalabs")));
     expect(panel.ipBlockedOrgs).toEqual(["sanalabs"]);
     expect(panel.ssoOrgs).toEqual([]);
   });
